@@ -1,1 +1,150 @@
-# aiii
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+
+# --- Step 1: Robust Data Loading ---
+
+file_path = 'Tesla Stock Price History.csv'
+if not os.path.exists(file_path):
+    raise FileNotFoundError(f"File '{file_path}' not found.")
+
+# Read CSV with thousands separator and treat '-' and empty strings as NA
+df = pd.read_csv(file_path, thousands=',', na_values=['-', 'NA', ''])
+
+# Check columns
+print("Columns:", df.columns.tolist())
+
+# --- Step 2: Robust Numeric Conversion ---
+# We'll convert Price, Open, High, Low to numeric; for 'Vol.' we allow missing values.
+numeric_cols = ['Price', 'Open', 'High', 'Low']
+for col in numeric_cols:
+    df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce')
+
+# For Volume, convert if possible; if not, we'll fill missing later.
+df['Vol.'] = pd.to_numeric(df['Vol.'].astype(str).str.replace(',', ''), errors='coerce')
+
+# --- Step 3: Date Conversion and Basic Cleaning ---
+df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+# Drop rows missing critical values (Date, Price, Open, High, Low) but allow missing Vol.
+df.dropna(subset=['Date', 'Price', 'Open', 'High', 'Low'], inplace=True)
+
+# Optionally, fill missing Vol. with 0 (or another default)
+df['Vol.'] = df['Vol.'].fillna(0)
+
+# Sort by Date (oldest first)
+df.sort_values(by='Date', inplace=True)
+df.reset_index(drop=True, inplace=True)
+
+print("Rows after basic preprocessing:", len(df))
+if df.empty:
+    raise ValueError("DataFrame is empty after basic preprocessing. Check your CSV file.")
+
+# --- Step 4: Feature Engineering (Technical Indicators) ---
+
+# Calculate previous close and moving averages; use min_periods=1 to avoid losing early rows.
+df['Prev_Close'] = df['Price'].shift(1)
+df['MA7'] = df['Price'].rolling(window=7, min_periods=1).mean()
+df['MA14'] = df['Price'].rolling(window=14, min_periods=1).mean()
+
+# RSI calculation
+delta = df['Price'].diff()
+up = delta.clip(lower=0)
+down = -delta.clip(upper=0)
+ema_up = up.ewm(com=14, adjust=False).mean()
+ema_down = down.ewm(com=14, adjust=False).mean()
+rs = ema_up / ema_down
+df['RSI'] = 100 - (100 / (1 + rs))
+
+# Volume change: fill missing with 0
+df['Volume_Change'] = df['Vol.'].pct_change(fill_method=None).fillna(0)
+
+# Drop any remaining NaNs from feature engineering (should be minimal now)
+df.dropna(inplace=True)
+
+print("Rows after feature engineering:", len(df))
+if df.empty:
+    raise ValueError("DataFrame is empty after feature engineering. Check your data.")
+
+# --- Step 5: KNN Model for Entry Signal ---
+
+# Create additional features for entry signal
+df['Open-Close'] = df['Open'] - df['Price']
+df['High-Low'] = df['High'] - df['Low']
+
+X_class = df[['Open-Close', 'High-Low', 'MA7', 'RSI', 'Volume_Change']]
+y_class = np.where(df['Price'].shift(-1) > df['Price'], 1, -1)
+
+print("X_class shape:", X_class.shape)
+print("y_class shape:", y_class.shape)
+
+# Split the data for KNN (chronological split)
+X_train_c, X_test_c, y_train_c, y_test_c = train_test_split(
+    X_class, y_class, test_size=0.3, shuffle=False
+)
+
+# Hyperparameter tuning for KNN
+knn_params = {'n_neighbors': [5, 10, 15, 20]}
+grid_knn = GridSearchCV(KNeighborsClassifier(), knn_params, cv=5)
+grid_knn.fit(X_train_c, y_train_c)
+
+# Predict buy/sell signals
+df['Signal'] = grid_knn.predict(X_class)
+
+# --- Step 6: Random Forest for Exit Target Price ---
+
+X_regress = df[['Prev_Close', 'MA7', 'MA14', 'RSI', 'Volume_Change']]
+y_regress = df['Price'].shift(-1)
+X_regress.dropna(inplace=True)
+y_regress = y_regress.loc[X_regress.index]
+
+X_train_r, X_test_r, y_train_r, y_test_r = train_test_split(
+    X_regress, y_regress, test_size=0.3, shuffle=False
+)
+
+rf_params = {
+    'n_estimators': [50, 100],
+    'max_depth': [10, 20, None],
+}
+grid_rf = GridSearchCV(RandomForestRegressor(random_state=42), rf_params, cv=5)
+grid_rf.fit(X_train_r, y_train_r)
+
+# Predict target prices
+df['Predicted_Price'] = grid_rf.predict(X_regress)
+
+# --- Step 7: Hybrid Position Logic ---
+
+df['Position'] = 0
+for i in range(len(df) - 1):
+    if df['Signal'].iloc[i] == 1 and df['Position'].iloc[i] == 0:
+        df['Position'].iloc[i + 1] = 1
+    elif df['Position'].iloc[i] == 1:
+        if df['Price'].iloc[i] >= df['Predicted_Price'].iloc[i]:
+            df['Position'].iloc[i + 1] = 0
+        else:
+            df['Position'].iloc[i + 1] = 1
+
+# --- Step 8: Returns Calculation and Visualization ---
+
+df['Returns'] = np.log(df['Price'] / df['Price'].shift(1))
+df['Strategy_Returns'] = df['Position'].shift(1) * df['Returns']
+
+df['Cumulative_Stock_Returns'] = df['Returns'].cumsum()
+df['Cumulative_Strategy_Returns'] = df['Strategy_Returns'].cumsum()
+
+plt.figure(figsize=(12, 6))
+plt.plot(df['Date'], df['Cumulative_Stock_Returns'], label='Tesla Stock Returns', color='blue')
+plt.plot(df['Date'], df['Cumulative_Strategy_Returns'], label='Hybrid Strategy Returns', color='green')
+plt.legend()
+plt.title('Enhanced Hybrid Strategy vs. Tesla Stock')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Returns')
+plt.grid(True)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+![image](https://github.com/user-attachments/assets/98afa0a6-0692-47e1-8e84-79bb3bc08161)
